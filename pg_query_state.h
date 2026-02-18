@@ -54,6 +54,15 @@ typedef enum
 } PG_QS_RequestResult;
 
 /*
+ * An self-explanarory enum describing the send_msg_by_parts results
+ */
+typedef enum
+{
+	MSG_BY_PARTS_SUCCEEDED,
+	MSG_BY_PARTS_FAILED
+} msg_by_parts_result;
+
+/*
  *	Format of transmited data through message queue
  */
 typedef struct
@@ -68,12 +77,21 @@ typedef struct
 												text records */
 } shm_mq_msg;
 
+/*
+ * User id transmit format.
+ */
+typedef struct
+{
+	Oid			userid;
+	uint32		reqid;
+}			shm_mq_userid_msg;
+
 #define BASE_SIZEOF_SHM_MQ_MSG (offsetof(shm_mq_msg, stack_depth))
 
 /* pg_query_state arguments */
 typedef struct
 {
-	int     reqid;
+	pg_atomic_uint32 cur_reqid;
 	bool 	verbose;
 	bool	costs;
 	bool	timing;
@@ -83,17 +101,19 @@ typedef struct
 } pg_qs_params;
 
 /* pg_query_state */
-extern bool 	pg_qs_enable;
-extern bool 	pg_qs_timing;
-extern bool 	pg_qs_buffers;
-extern List 	*QueryDescStack;
-extern pg_qs_params *params;
-extern shm_mq 	*mq;
+extern bool pg_qs_enable;
+extern bool pg_qs_timing;
+extern bool pg_qs_buffers;
+extern List *QueryDescStack;
+extern pg_qs_params * params;
+extern shm_mq *mq;
+extern uint32 *mq_req_id;
 
 /* signal_handler.c */
 extern void SendQueryState(void);
-extern void DetachPeer(void);
-extern void UnlockShmem(LOCKTAG *tag);
-extern void LockShmem(LOCKTAG *tag, uint32 key);
+extern void SendCurrentUserId(void);
+extern void UnlockShmem(uint32 key);
+extern void LockShmem(uint32 key);
+extern msg_by_parts_result send_msg_by_parts(shm_mq_handle *mqh, Size nbytes, const void *data);
 
 #endif
