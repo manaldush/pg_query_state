@@ -20,8 +20,9 @@ def test_deadlock(config):
 	acon1, acon2 = common.n_async_connect(config, 2)
 	acurs1 = acon1.cursor()
 	acurs2 = acon2.cursor()
+	checkFurther = True
 
-	while True:
+	while checkFurther:
 		acurs1.callproc('pg_query_state', (acon2.get_backend_pid(),))
 		acurs2.callproc('pg_query_state', (acon1.get_backend_pid(),))
 
@@ -29,13 +30,13 @@ def test_deadlock(config):
 		r, w, x = select.select([acon1.fileno(), acon2.fileno()], [], [], 10)
 		assert (r or w or x), "Deadlock is happened under cross reading of query states"
 
-		common.wait(acon1)
-		common.wait(acon2)
-
-		# exit from loop if one backend could read state of execution 'pg_query_state'
-		# from other backend
-		if acurs1.fetchone() or acurs2.fetchone():
-			break
+		for acon in [acon1, acon2]:
+			try:
+				common.wait(acon)
+			except psycopg2.errors.InternalError as e:
+				assert(checkFurther), "Failure should occur once"
+				assert(e.pgcode == "XX000")
+				checkFurther = False
 
 	common.n_close((acon1, acon2))
 

@@ -112,8 +112,8 @@ extern uint32 *mq_req_id;
 /* signal_handler.c */
 extern void SendQueryState(void);
 extern void SendCurrentUserId(void);
-extern void UnlockShmem(LOCKTAG *tag);
-extern void LockShmem(LOCKTAG *tag, uint32 key);
+extern void UnlockShmem(uint32 key);
+extern void LockShmem(uint32 key);
 extern msg_by_parts_result send_msg_by_parts(shm_mq_handle *mqh, Size nbytes, const void *data);
 
 #endif

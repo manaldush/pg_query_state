@@ -91,6 +91,7 @@ static shm_toc			  *toc = NULL;
 pg_qs_params	   *params = NULL;
 shm_mq			   *mq = NULL;
 uint32			   *mq_req_id = NULL;
+static LWLock *shmem_locks;
 
 /*
  * Estimate amount of shared memory needed.
@@ -158,6 +159,7 @@ pg_qs_shmem_startup(void)
 		mq_req_id = shm_toc_lookup(toc, num_toc++, false);
 #endif
 	}
+	shmem_locks = &(GetNamedLWLockTranche("pg_query_state"))->lock;
 	LWLockRelease(AddinShmemInitLock);
 
 	if (prev_shmem_startup_hook)
@@ -185,6 +187,7 @@ _PG_init(void)
 	shmem_request_hook = pg_qs_shmem_request;
 #else
 	RequestAddinShmemSpace(pg_qs_shmem_size());
+	RequestNamedLWLockTranche("pg_query_state", 2);
 #endif
 
 	/* Register interrupt on custom signal of polling query state */
@@ -252,6 +255,7 @@ pg_qs_shmem_request(void)
 		prev_shmem_request_hook();
 
 	RequestAddinShmemSpace(pg_qs_shmem_size());
+	RequestNamedLWLockTranche("pg_query_state", 2);
 }
 #endif
 
@@ -407,24 +411,25 @@ search_be_status(int pid)
 
 
 void
-UnlockShmem(LOCKTAG *tag)
+UnlockShmem(uint32 key)
 {
-	LockRelease(tag, ExclusiveLock, false);
+	LWLock     *lock;
+
+	Assert(key <= PG_QS_SND_KEY);
+	lock = (LWLock *) ((LWLockPadded *) shmem_locks + key);
+	Assert(LWLockHeldByMe(lock));
+	LWLockRelease(lock);
 }
 
 void
-LockShmem(LOCKTAG *tag, uint32 key)
+LockShmem(uint32 key)
 {
-	LockAcquireResult result;
-	tag->locktag_field1 = PG_QS_MODULE_KEY;
-	tag->locktag_field2 = key;
-	tag->locktag_field3 = 0;
-	tag->locktag_field4 = 0;
-	tag->locktag_type = LOCKTAG_USERLOCK;
-	tag->locktag_lockmethodid = USER_LOCKMETHOD;
-	result = LockAcquire(tag, ExclusiveLock, false, false);
-	Assert(result == LOCKACQUIRE_OK);
-	elog(DEBUG1, "LockAcquireResult is not OK %d", result);
+	LWLock     *lock;
+
+	Assert(key <= PG_QS_SND_KEY);
+	lock = (LWLock *) ((LWLockPadded *) shmem_locks + key);
+	Assert(!LWLockHeldByMe(lock));
+	LWLockAcquire(lock, LW_EXCLUSIVE);
 }
 
 
@@ -507,7 +512,6 @@ pg_query_state(PG_FUNCTION_ARGS)
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		LOCKTAG			 tag;
 		bool			 verbose = PG_GETARG_BOOL(1),
 						 costs = PG_GETARG_BOOL(2),
 						 timing = PG_GETARG_BOOL(3),
@@ -556,14 +560,14 @@ pg_query_state(PG_FUNCTION_ARGS)
 		 * init and acquire lock so that any other concurrent calls of this fuction
 		 * can not occupy shared queue for transfering query state
 		 */
-		LockShmem(&tag, PG_QS_RCV_KEY);
+		LockShmem(PG_QS_RCV_KEY);
 
 		reqid = pg_atomic_add_fetch_u32(&params->cur_reqid, 1);
 
 		counterpart_user_id = GetRemoteBackendUserId(proc);
 		if (!(superuser() || GetUserId() == counterpart_user_id))
 		{
-			UnlockShmem(&tag);
+			UnlockShmem(PG_QS_RCV_KEY);
 			ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 							errmsg("permission denied")));
 		}
@@ -583,7 +587,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 		if (list_length(msgs) == 0)
 		{
 			elog(WARNING, "backend does not reply");
-			UnlockShmem(&tag);
+			UnlockShmem(PG_QS_RCV_KEY);
 			SRF_RETURN_DONE(funcctx);
 		}
 
@@ -600,12 +604,12 @@ pg_query_state(PG_FUNCTION_ARGS)
 					else
 						elog(INFO, "backend is not running query");
 
-					UnlockShmem(&tag);
+					UnlockShmem(PG_QS_RCV_KEY);
 					SRF_RETURN_DONE(funcctx);
 				}
 			case STAT_DISABLED:
 				elog(INFO, "query execution statistics disabled");
-				UnlockShmem(&tag);
+				UnlockShmem(PG_QS_RCV_KEY);
 				SRF_RETURN_DONE(funcctx);
 			case QS_RETURNED:
 				{
@@ -667,7 +671,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 					TupleDescInitEntry(tupdesc, (AttrNumber) 5, "leader_pid", INT4OID, -1, 0);
 					funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
-					UnlockShmem(&tag);
+					UnlockShmem(PG_QS_RCV_KEY);
 					MemoryContextSwitchTo(oldcontext);
 				}
 				break;
@@ -736,7 +740,6 @@ GetRemoteBackendUserId(PGPROC *proc)
 	shm_mq_result mq_receive_result;
 	shm_mq_userid_msg *msg;
 	Size		msg_len;
-	LOCKTAG		tag;
 
 #if PG_VERSION_NUM >= 170000
 	Assert(proc && proc->vxid.procNumber != INVALID_PROC_NUMBER);
@@ -747,12 +750,12 @@ GetRemoteBackendUserId(PGPROC *proc)
 	Assert(UserIdPollReason != INVALID_PROCSIGNAL);
 	Assert(mq);
 
-	LockShmem(&tag, PG_QS_SND_KEY);
+	LockShmem(PG_QS_SND_KEY);
 	mq = shm_mq_create(mq, QUEUE_SIZE);
 	shm_mq_set_sender(mq, proc);
 	shm_mq_set_receiver(mq, MyProc);
 	*mq_req_id = pg_atomic_read_u32(&params->cur_reqid);
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 
 #if PG_VERSION_NUM >= 170000
 	sig_result = SendProcSignal(proc->pid, UserIdPollReason, proc->vxid.procNumber);
@@ -897,10 +900,9 @@ SendBgWorkerPids(void)
 	int				 msg_len;
 	int				 i;
 	shm_mq_handle 	*mqh;
-	LOCKTAG		     tag;
 	msg_by_parts_result	 result;
 
-	LockShmem(&tag, PG_QS_SND_KEY);
+	LockShmem(PG_QS_SND_KEY);
 	mqh = shm_mq_attach(mq, NULL, NULL);
 
 	if (*mq_req_id != pg_atomic_read_u32(&params->cur_reqid) || shm_mq_get_sender(mq) != MyProc)
@@ -911,7 +913,7 @@ SendBgWorkerPids(void)
 #else
 		shm_mq_detach(mqh);
 #endif
-		UnlockShmem(&tag);
+		UnlockShmem(PG_QS_SND_KEY);
 		return;
 	}
 
@@ -950,7 +952,7 @@ SendBgWorkerPids(void)
 		shm_mq_detach(mqh);
 #endif
 	}
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 }
 
 /*
@@ -966,7 +968,6 @@ GetRemoteBackendWorkers(PGPROC *proc)
 	Size			 msg_len;
 	int				 i;
 	List			*result = NIL;
-	LOCKTAG			 tag;
 	bool			 mqh_attached = false;
 
 #if PG_VERSION_NUM >= 170000
@@ -978,12 +979,12 @@ GetRemoteBackendWorkers(PGPROC *proc)
 	Assert(WorkerPollReason != INVALID_PROCSIGNAL);
 	Assert(mq);
 
-	LockShmem(&tag, PG_QS_SND_KEY);
+	LockShmem(PG_QS_SND_KEY);
 	mq = shm_mq_create(mq, QUEUE_SIZE);
 	shm_mq_set_sender(mq, proc);
 	shm_mq_set_receiver(mq, MyProc);
 	*mq_req_id = pg_atomic_read_u32(&params->cur_reqid);
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 
 #if PG_VERSION_NUM >= 170000
 	sig_result = SendProcSignal(proc->pid, WorkerPollReason, proc->vxid.procNumber);
@@ -1138,7 +1139,6 @@ GetRemoteBackendQueryStates(PGPROC *leader,
 	shm_mq_result	 mq_receive_result;
 	shm_mq_msg		*msg;
 	Size			 len;
-	LOCKTAG			 tag;
 
 	Assert(QueryStatePollReason != INVALID_PROCSIGNAL);
 	Assert(mq);
@@ -1153,12 +1153,12 @@ GetRemoteBackendQueryStates(PGPROC *leader,
 	pg_write_barrier();
 
 	/* initialize message queue that will transfer query states */
-	LockShmem(&tag, PG_QS_SND_KEY);
+	LockShmem(PG_QS_SND_KEY);
 	mq = shm_mq_create(mq, QUEUE_SIZE);
 	shm_mq_set_sender(mq, leader);
 	shm_mq_set_receiver(mq, MyProc);
 	*mq_req_id = pg_atomic_read_u32(&params->cur_reqid);
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 
 	/*
 	 * send signal `QueryStatePollReason` to all processes and define all alive
@@ -1207,14 +1207,14 @@ GetRemoteBackendQueryStates(PGPROC *leader,
 
 		/* prepare message queue to transfer data */
 		elog(DEBUG1, "Wait response from worker %d", proc->pid);
-		LockShmem(&tag, PG_QS_SND_KEY);
+		LockShmem(PG_QS_SND_KEY);
 		mq = shm_mq_create(mq, QUEUE_SIZE);
 		shm_mq_set_sender(mq, proc);
 		shm_mq_set_receiver(mq, MyProc);	/* this function notifies the
 											   counterpart to come into data
 											   transfer */
 		*mq_req_id = pg_atomic_read_u32(&params->cur_reqid);
-		UnlockShmem(&tag);
+		UnlockShmem(PG_QS_SND_KEY);
 
 #if PG_VERSION_NUM >= 170000
 		sig_result = SendProcSignal(proc->pid,
@@ -1438,7 +1438,6 @@ pg_progress_bar(PG_FUNCTION_ARGS)
 	List			*msgs;
 	double			progress;
 	double			old_progress;
-	LOCKTAG			tag;
 
 	if (PG_NARGS() == 2)
 	{
@@ -1472,7 +1471,7 @@ pg_progress_bar(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("backend with pid=%d not found", pid)));
 
-	LockShmem(&tag, PG_QS_RCV_KEY);
+	LockShmem(PG_QS_RCV_KEY);
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -1500,19 +1499,19 @@ pg_progress_bar(PG_FUNCTION_ARGS)
 	{
 		case QUERY_NOT_RUNNING:
 			elog(INFO, "query not runing");
-			UnlockShmem(&tag);
+			UnlockShmem(PG_QS_RCV_KEY);
 			PG_RETURN_FLOAT8((float8) -1);
 			break;
 		case STAT_DISABLED:
 			elog(INFO, "query execution statistics disabled");
-			UnlockShmem(&tag);
+			UnlockShmem(PG_QS_RCV_KEY);
 			PG_RETURN_FLOAT8((float8) -1);
 		default:
 			break;
 	}
 	if (msg->result_code == QS_RETURNED && delay == 0)
 	{
-		UnlockShmem(&tag);
+		UnlockShmem(PG_QS_RCV_KEY);
 		progress = GetCurrentNumericState(msg);
 		if (progress < 0)
 		{
@@ -1555,9 +1554,9 @@ pg_progress_bar(PG_FUNCTION_ARGS)
 		}
 		if (progress > -1)
 			elog(INFO, "\rProgress = 1.000000");
-		UnlockShmem(&tag);
+		UnlockShmem(PG_QS_RCV_KEY);
 		PG_RETURN_FLOAT8((float8) 1);
 	}
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_RCV_KEY);
 	PG_RETURN_FLOAT8((float8) -1);
 }

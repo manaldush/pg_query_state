@@ -218,9 +218,8 @@ void
 SendQueryState(void)
 {
 	shm_mq_handle  *mqh;
-	LOCKTAG			tag;
 
-	LockShmem(&tag, PG_QS_SND_KEY);
+	LockShmem(PG_QS_SND_KEY);
 
 	elog(DEBUG1, "Worker %d receives pg_query_state request from %d", shm_mq_get_sender(mq)->pid, shm_mq_get_receiver(mq)->pid);
 	mqh = shm_mq_attach(mq, NULL, NULL);
@@ -228,7 +227,7 @@ SendQueryState(void)
 	if (*mq_req_id != pg_atomic_read_u32(&params->cur_reqid) || shm_mq_get_sender(mq) != MyProc)
 	{
 		elog(WARNING, "could not send message queue to shared-memory queue: receiver has been interrupted and new request is being processed now.");
-		UnlockShmem(&tag);
+		UnlockShmem(PG_QS_SND_KEY);
 		return;
 	}
 	/* check if module is enabled */
@@ -277,7 +276,7 @@ SendQueryState(void)
 		}
 	}
 	elog(DEBUG1, "Worker %d sends response for pg_query_state to %d", shm_mq_get_sender(mq)->pid, shm_mq_get_receiver(mq)->pid);
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 
 	return;
 
@@ -287,7 +286,7 @@ connection_cleanup:
 #else
 	shm_mq_detach(mqh);
 #endif
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 }
 
 void
@@ -295,10 +294,9 @@ SendCurrentUserId(void)
 {
 	shm_mq_handle *mqh;
 	shm_mq_userid_msg msg;
-	LOCKTAG			tag;
 
 	msg.userid = GetUserId();
-	LockShmem(&tag, PG_QS_SND_KEY);
+	LockShmem(PG_QS_SND_KEY);
 
 	mqh = shm_mq_attach(mq, NULL, NULL);
 	msg.reqid = *mq_req_id;
@@ -312,5 +310,5 @@ SendCurrentUserId(void)
 #else
 	shm_mq_detach(mqh);
 #endif
-	UnlockShmem(&tag);
+	UnlockShmem(PG_QS_SND_KEY);
 }
